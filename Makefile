@@ -3,6 +3,11 @@ UV := uv
 HF_CACHE := /goinfre/$(user)/hf_cache
 UV_CACHE_DIR := /goinfre/$(user)/uv_cache
 
+install-home:
+	uv sync
+
+run-home:
+	uv run python -m src
 
 install:
 	@mkdir -p $(UV_CACHE_DIR)
