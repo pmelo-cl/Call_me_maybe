@@ -1,11 +1,26 @@
+UV := uv
+
+HF_CACHE := /goinfre/$(user)/hf_cache
+UV_CACHE_DIR := /goinfre/$(user)/uv_cache
+
+
 install:
-	uv sync
+	@mkdir -p $(UV_CACHE_DIR)
+	@UV_CACHE_DIR=$(UV_CACHE_DIR) $(UV) sync
 
 run:
-	uv run python -m src
+	@mkdir -p $(HF_CACHE)
+	@HF_HOME=$(HF_CACHE)
+	HUGGINGFASE_HUB_CACHE=$(HF_CACHE) \
+	TRANSFORMERS_CACHE=$(HF_CACHE) \
+	$(UV) run python -m src
 
 debug:
-	uv run python -m pdb -m src
+	@mkdir -p $(HF_CACHE)
+	@HF_HOME=$(HF_CACHE)
+	HUGGINGFASE_HUB_CACHE=$(HF_CACHE) \
+	TRANSFORMERS_CACHE=$(HF_CACHE) \
+	$(UV) run python -m pdb src
 
 clean:
 	find . -type d -name __pycache__ -exec rm -rf {} +
