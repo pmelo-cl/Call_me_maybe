@@ -1,4 +1,3 @@
-"""Punto de entrada del programa."""
 import argparse
 import json
 import shutil
@@ -21,18 +20,52 @@ except ImportError:
     )
     sys.exit(1)
 
-BAR_WIDTH = 40
+BAR_WIDTH = 36
+_LABEL_W = 24   # ancho fijo para las etiquetas → columnas alineadas
 
 
 def _bar(filled: int, total: int, width: int = BAR_WIDTH) -> str:
-    """Devuelve una cadena de barra de progreso tipo [####----]."""
     done = int(width * filled / total) if total else width
-    return f"[{'#' * done}{'-' * (width - done)}]"
+    return f"[{'#' * done}{'·' * (width - done)}]"
 
 
-def _fmt_seconds(secs: float) -> str:
+def _fmt(secs: float) -> str:
     m, s = divmod(int(secs), 60)
     return f"{m:02d}:{s:02d}"
+
+
+def _term_width() -> int:
+    return shutil.get_terminal_size(fallback=(80, 24)).columns
+
+
+def _clear_line() -> None:
+    """Sobreescribe la línea actual con espacios y vuelve al inicio."""
+    sys.stdout.write(f"\r{' ' * _term_width()}\r")
+    sys.stdout.flush()
+
+
+def _print_bar(desc: str, filled: int, total: int, elapsed: float) -> None:
+    """Escribe la barra de progreso en la línea actual (sin newline)."""
+    rate = filled / elapsed if elapsed > 0 else 0.0
+    eta: Optional[float] = (total - filled) / rate if rate > 0 and filled else None
+    eta_str = _fmt(eta) if eta is not None else "--:--"
+    bar = _bar(filled, total)
+    label = f"{desc}:".ljust(_LABEL_W)
+    line = f"\r{label} {bar} {filled:>4}/{total} [{_fmt(elapsed)}<{eta_str}]"
+    sys.stdout.write(line)
+    sys.stdout.flush()
+
+
+def log(msg: str) -> None:
+    """
+    Imprime *msg* en su propia línea limpia.
+    Debe usarse en lugar de print() dentro de bucles progress().
+    Borra la barra activa, imprime el mensaje y la barra reaparecerá
+    en la próxima iteración.
+    """
+    _clear_line()
+    sys.stdout.write(msg + "\n")
+    sys.stdout.flush()
 
 
 def progress(
@@ -40,42 +73,38 @@ def progress(
     desc: str,
     unit: str = "it",
 ) -> Iterator[Any]:
-    """Itera sobre *iterable* mostrando una barra de progreso en línea."""
+    """
+    Itera sobre *iterable* mostrando una barra de progreso.
+
+    La barra se dibuja ANTES de ceder cada elemento para que siempre
+    esté visible mientras el trabajo ocurre. Cuando el bucle exterior
+    necesite imprimir algo, debe llamar a log() en lugar de print()
+    para no solaparse con la barra.
+    """
     total = len(iterable)
     t0 = time.monotonic()
 
     for i, item in enumerate(iterable):
-        elapsed = time.monotonic() - t0
-        rate = i / elapsed if elapsed > 0 else 0.0
-        eta: Optional[float] = (total - i) / rate if rate > 0 else None
-        eta_str = _fmt_seconds(eta) if eta is not None else "--:--"
-        bar = _bar(i, total)
-        line = (
-            f"\r{desc}: {bar} {i}/{total} {unit} "
-            f"[{_fmt_seconds(elapsed)}<{eta_str}]"
-        )
-        sys.stdout.write(line)
-        sys.stdout.flush()
+        _print_bar(desc, i, total, time.monotonic() - t0)
         yield item
 
+    # Barra final al 100 %
     elapsed = time.monotonic() - t0
+    label = f"{desc}:".ljust(_LABEL_W)
     bar = _bar(total, total)
     sys.stdout.write(
-        f"\r{desc}: {bar} {total}/{total} {unit} "
-        f"[{_fmt_seconds(elapsed)}]\n"
+        f"\r{label} {bar} {total:>4}/{total} [{_fmt(elapsed)}]\n"
     )
     sys.stdout.flush()
 
 
-def spinner(desc: str) -> "SpinnerContext":
-    """Devuelve un contexto que muestra una barra de progreso indeterminada."""
-    return SpinnerContext(desc)
-
-
 class SpinnerContext:
-    """Context manager para tareas de duración desconocida."""
+    """
+    Context manager para tareas de duración desconocida.
+    Al salir imprime la barra llena con el tiempo total.
+    """
 
-    _FRAMES = ["[>---]", "[--->]", "[--<-]", "[<---]"]
+    _FRAMES = ["[>···]", "[·>··]", "[··>·]", "[···>]"]
 
     def __init__(self, desc: str) -> None:
         self._desc = desc
@@ -84,25 +113,31 @@ class SpinnerContext:
 
     def __enter__(self) -> "SpinnerContext":
         self._t0 = time.monotonic()
-        sys.stdout.write(f"\r{self._desc}: {self._FRAMES[0]}  ")
+        label = f"{self._desc}:".ljust(_LABEL_W)
+        sys.stdout.write(f"\r{label} {self._FRAMES[0]}")
         sys.stdout.flush()
         return self
 
     def tick(self) -> None:
         self._frame = (self._frame + 1) % len(self._FRAMES)
         elapsed = time.monotonic() - self._t0
+        label = f"{self._desc}:".ljust(_LABEL_W)
         sys.stdout.write(
-            f"\r{self._desc}: {self._FRAMES[self._frame]} "
-            f"[{_fmt_seconds(elapsed)}]  "
+            f"\r{label} {self._FRAMES[self._frame]} [{_fmt(elapsed)}]  "
         )
         sys.stdout.flush()
 
     def __exit__(self, *_: object) -> None:
         elapsed = time.monotonic() - self._t0
-        width = shutil.get_terminal_size(fallback=(80, 24)).columns
-        done = f"\r{self._desc}: [{'#' * BAR_WIDTH}] [{_fmt_seconds(elapsed)}]"
-        sys.stdout.write(done.ljust(width) + "\n")
+        label = f"{self._desc}:".ljust(_LABEL_W)
+        bar = f"[{'#' * BAR_WIDTH}]"
+        line = f"\r{label} {bar} [{_fmt(elapsed)}]"
+        sys.stdout.write(line.ljust(_term_width()) + "\n")
         sys.stdout.flush()
+
+
+def spinner(desc: str) -> SpinnerContext:
+    return SpinnerContext(desc)
 
 
 class TestCase(BaseModel):
@@ -116,14 +151,11 @@ class OutputRecord(BaseModel):
 
 
 def load_vocab(model: Any) -> Dict[int, str]:
-    """Carga el vocabulario en O(V) usando convert_ids_to_tokens."""
+    """Carga el vocabulario en O(V) sin forward pass usando el tokenizer."""
     tokenizer = model._tokenizer
     vocab: Dict[str, int] = tokenizer.get_vocab()
     ids = list(vocab.values())
-    # convert_ids_to_tokens es una operación de tabla hash,
-    # ~150k entradas en <1s
     tokens: List[str] = tokenizer.convert_ids_to_tokens(ids)
-    # Decodifica los bytes BPE (ej. "Ġhello" → " hello") en un solo batch
     decoded: List[str] = [
         tokenizer.convert_tokens_to_string([t]) for t in tokens
     ]
@@ -165,50 +197,50 @@ def main() -> None:
 
     for label, path in (("input", input_path), ("definitions", defs_path)):
         if not path.exists():
-            print(f"Error: archivo de {label} no encontrado: {path}")
-            sys.exit(1)
+            sys.exit(f"Error: archivo de {label} no encontrado: {path}")
 
     functions: List[FunctionDefinition]
     with spinner("Loading definitions") as sp:
         functions = load_function_definitions(defs_path)
         sp.tick()
-    print(f"  ✓ {len(functions)} functions loaded.")
+    print(f"  ✓ {len(functions)} function(s) loaded.")
 
     test_cases: List[TestCase]
     with spinner("Loading test cases") as sp:
         test_cases = load_test_cases(input_path)
         sp.tick()
-    print(f"  ✓ {len(test_cases)} test cases loaded.")
+    print(f"  ✓ {len(test_cases)} test case(s) loaded.")
 
     model: Any
-    with spinner("Loading model  (Qwen3-0.6B)") as sp:
+    with spinner("Loading model") as sp:
         model = Small_LLM_Model(model_name="Qwen/Qwen3-0.6B")
         sp.tick()
 
     with spinner("Loading vocab") as sp:
         id_to_str = load_vocab(model)
         sp.tick()
-    print(f"    Vocabulary size: {len(id_to_str)}")
+    print(f"  ✓ {len(id_to_str)} tokens in vocabulary.")
 
     decoder = ConstrainedDecoder(model, id_to_str, functions)
-    with spinner("Warming up KV-cache") as sp:
-        decoder._get_prefix_pkv()
-        sp.tick()
+
+    # NOTA: Ya no es necesario el "Warming up KV-cache" porque el decoder
+    # reconstruye el contexto desde cero en cada llamada a generate().
 
     results: List[OutputRecord] = []
     for case in progress(test_cases, desc="Processing prompts", unit="prompt"):
         try:
             fn_name, args_dict = decoder.generate(case.prompt)
             results.append(
-                OutputRecord(prompt=case.prompt, fn_name=fn_name,
-                             args=args_dict)
+                OutputRecord(
+                    prompt=case.prompt, fn_name=fn_name, args=args_dict
+                )
             )
-            print(f"    {fn_name}({args_dict})")
+            log(f"  ✓ {fn_name}  {args_dict}")
         except Exception as exc:  # noqa: BLE001
-            print(f"    error en '{case.prompt}': {exc}")
             results.append(
                 OutputRecord(prompt=case.prompt, fn_name="error", args={})
             )
+            log(f"  ✗ {case.prompt!r}: {exc}")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with spinner("Writing results") as sp:
@@ -220,7 +252,7 @@ def main() -> None:
                 separators=(",", ": "),
             )
         sp.tick()
-    print(f"    Done → '{output_path}'")
+    print(f"  ✓ Results written to '{output_path}'.")
 
 
 if __name__ == "__main__":

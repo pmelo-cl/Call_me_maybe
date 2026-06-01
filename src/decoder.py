@@ -1,5 +1,5 @@
-import json
-from typing import Any, Dict, List, Optional, Tuple
+"""Generación guiada por fases: el modelo elige valores, nosotros construimos el JSON."""
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -7,11 +7,7 @@ import torch
 
 from .schema_utils import FunctionDefinition
 
-# Prefijo fijo que el decoder añade antes del JSON generado
 _JSON_PREFIX = '{"fn_name":"'
-
-# Número de llaves abiertas que necesita el JSON de salida: { args: { } }
-_EXPECTED_DEPTH = 2
 
 
 class ConstrainedDecoder:
@@ -24,19 +20,19 @@ class ConstrainedDecoder:
         self.model = model
         self.vocab = vocab
         self.functions = functions
-
+        self._fn_by_name: Dict[str, FunctionDefinition] = {
+            f.name: f for f in functions
+        }
         self._static_prompt: str = self._build_static_prompt()
-        self._prefix_ids: List[int] = []
-        self._prefix_pkv: Optional[Any] = None
+        self._prefix_ids: List[int] = self._encode_static_prompt()
+
+    # ── Prompt ───────────────────────────────────────────────────────────────
 
     def _build_static_prompt(self) -> str:
-        """Parte del prompt que no cambia entre llamadas."""
         func_lines = [
             f"- {f.name}({', '.join(f.parameters.keys())})"
             for f in self.functions
         ]
-        func_list = "\n".join(func_lines)
-
         examples: List[Tuple[str, str]] = [
             (
                 "What is the sum of 2 and 3?",
@@ -71,7 +67,7 @@ class ConstrainedDecoder:
                 ),
             ),
             (
-                'Substitute the word "cat" with "dog" in'
+                'Substitute "cat" with "dog" in'
                 ' "The cat sat on the mat with another cat"',
                 (
                     '{"fn_name": "fn_substitute_string_with_regex",'
@@ -82,156 +78,157 @@ class ConstrainedDecoder:
             ),
         ]
         ex_text = "\n".join(f"Q: {q}\nA: {a}" for q, a in examples)
+        func_list = "\n".join(func_lines)
         return f"Functions:\n{func_list}\n\nExamples:\n{ex_text}\n\nQ: "
 
-    def _get_prefix_pkv(self) -> Tuple[List[int], Any]:
-        """Procesa el prompt estático una vez y guarda los past_key_values."""
-        if self._prefix_pkv is not None:
-            return self._prefix_ids, self._prefix_pkv
+    def _encode_static_prompt(self) -> List[int]:
+        """Codifica el prompt estático una vez y devuelve sus IDs."""
+        return self.model.encode(self._static_prompt)[0].tolist()
 
-        ids = self.model.encode(self._static_prompt)[0].tolist()
-        tensor = torch.tensor([ids], device=self.model._device,
-                              dtype=torch.long)
+    # ── Low-level helpers ─────────────────────────────────────────────────────
+
+    def _forward(
+        self,
+        ids: List[int],
+        pkv: Any,
+    ) -> Tuple[npt.NDArray[np.float32], Any]:
+        """Forward pass sobre *ids* con KV-cache; devuelve logits y nuevo pkv."""
+        tensor = torch.tensor(
+            [ids], device=self.model._device, dtype=torch.long
+        )
         with torch.no_grad():
-            out = self.model._model(input_ids=tensor, use_cache=True)
-        self._prefix_ids = ids
-        self._prefix_pkv = out.past_key_values
-        return ids, self._prefix_pkv
+            out = self.model._model(
+                input_ids=tensor, past_key_values=pkv, use_cache=True
+            )
+        logits: npt.NDArray[np.float32] = np.array(
+            out.logits[0, -1].tolist(), dtype=np.float32
+        )
+        return logits, out.past_key_values
+
+    def _inject(
+        self,
+        text: str,
+        pkv: Any,
+    ) -> Tuple[npt.NDArray[np.float32], Any]:
+        """Inyecta *text* como tokens forzados; devuelve logits del siguiente token."""
+        ids = self.model.encode(text)[0].tolist()
+        return self._forward(ids, pkv)
+
+    def _generate_until(
+        self,
+        stop: str,
+        logits: npt.NDArray[np.float32],
+        pkv: Any,
+        max_tokens: int = 64,
+    ) -> Tuple[str, npt.NDArray[np.float32], Any]:
+        """
+        Genera tokens hasta que *stop* aparezca en el texto acumulado.
+
+        El stop se busca token a token ANTES de añadir cada nuevo token
+        al buffer, para evitar que un token multi-carácter (p.ej. '"]')
+        oculte el stop y se incluya en el valor generado.
+
+        Devuelve el texto antes del stop, los últimos logits y el pkv.
+        """
+        generated = ""
+        for _ in range(max_tokens):
+            next_id = int(np.argmax(logits))
+            token = self.vocab.get(next_id, "")
+
+            # Si el stop está dentro del token, añadimos solo lo previo al stop
+            combined = generated + token
+            if stop in combined:
+                return combined[: combined.index(stop)], logits, pkv
+
+            generated = combined
+            logits, pkv = self._forward([next_id], pkv)
+
+        return generated, logits, pkv
+
+    # ── Guided generation ─────────────────────────────────────────────────────
 
     def generate(
         self,
         user_prompt: str,
-        max_new_tokens: int = 128,
+        max_value_tokens: int = 64,
     ) -> Tuple[str, Dict[str, Any]]:
-        """Genera fn_name y args usando KV-cache para el prefijo estático."""
-        _, pkv = self._get_prefix_pkv()
+        """
+        Generación guiada por fases.
 
-        # Sanitiza el user_prompt: reemplaza comillas simples por dobles
-        # para que no rompan el JSON generado
-        clean_prompt = user_prompt.replace("'", '"')
+        Reconstruye el contexto completo desde el prefijo estático en cada llamada,
+        evitando problemas de mutabilidad del KV-cache entre prompts distintos.
+        """
+        # 1. Construir la secuencia completa de IDs del prefijo + usuario + inicio JSON
+        suffix = user_prompt + f'\nA: {_JSON_PREFIX} '
+        full_ids = self._prefix_ids + self.model.encode(suffix)[0].tolist()
 
-        suffix_text = clean_prompt + f'\nA: {_JSON_PREFIX} '
-        suffix_ids: List[int] = self.model.encode(suffix_text)[0].tolist()
+        # 2. Forward inicial sin KV-cache (past_key_values=None)
+        logits, pkv = self._forward(full_ids, None)
 
-        tensor = torch.tensor(
-            [suffix_ids], device=self.model._device, dtype=torch.long
-        )
-        with torch.no_grad():
-            out = self.model._model(
-                input_ids=tensor,
-                past_key_values=pkv,
-                use_cache=True,
-            )
-        logits_np: npt.NDArray[np.float32] = np.array(
-            out.logits[0, -1].tolist(), dtype=np.float32
-        )
-        past = out.past_key_values
+        # ── Fase 1: nombre de la función ──────────────────────────────────────
+        fn_raw, logits, pkv = self._generate_until('"', logits, pkv)
+        fn_name = fn_raw.strip()
 
-        generated = ""
-        next_id = int(np.argmax(logits_np))
+        if fn_name not in self._fn_by_name:
+            fn_name = _closest(fn_name, list(self._fn_by_name.keys()))
 
-        for _ in range(max_new_tokens):
-            token = self.vocab.get(next_id, "")
-            generated += token
+        fn_def = self._fn_by_name[fn_name]
+        param_keys = list(fn_def.parameters.keys())
 
-            if self._is_complete(_JSON_PREFIX + generated):
-                break
+        if not param_keys:
+            return fn_name, {}
 
-            tok_tensor = torch.tensor(
-                [[next_id]], device=self.model._device, dtype=torch.long
-            )
-            with torch.no_grad():
-                out = self.model._model(
-                    input_ids=tok_tensor,
-                    past_key_values=past,
-                    use_cache=True,
+        # ── Fase 2: valores de los argumentos ─────────────────────────────────
+        args: Dict[str, Any] = {}
+
+        for i, key in enumerate(param_keys):
+            param_type = fn_def.parameters[key].type
+            is_last = i == len(param_keys) - 1
+
+            if i == 0:
+                scaffold = f'", "args": {{"{key}": '
+            else:
+                scaffold = f', "{key}": '
+            logits, pkv = self._inject(scaffold, pkv)
+
+            if param_type == "number":
+                stop_char = "}" if is_last else ","
+                value_str, logits, pkv = self._generate_until(
+                    stop_char, logits, pkv, max_tokens=max_value_tokens
                 )
-            logits_np = np.array(
-                out.logits[0, -1].tolist(), dtype=np.float32
-            )
-            past = out.past_key_values
-            next_id = int(np.argmax(logits_np))
-
-        raw = _JSON_PREFIX + generated
-        data = self._extract_json(raw)
-
-        fn_name: str = data["fn_name"].strip()
-        args: Dict[str, Any] = data.get("args", {})
-
-        fn: Optional[FunctionDefinition] = next(
-            (f for f in self.functions if f.name == fn_name), None
-        )
-        if fn:
-            for param, value in args.items():
-                expected_type = fn.parameters[param].type
-                if expected_type == "number" and isinstance(value,
-                                                            (int, float)):
-                    args[param] = float(value)
+                clean = value_str.strip().rstrip("},").strip()
+                try:
+                    args[key] = float(clean)
+                except ValueError:
+                    args[key] = _extract_number(clean)
+            else:
+                # Strings: inyectamos '"' de apertura; el modelo genera hasta '"'
+                logits, pkv = self._inject('"', pkv)
+                value_str, logits, pkv = self._generate_until(
+                    '"', logits, pkv, max_tokens=max_value_tokens
+                )
+                args[key] = value_str
 
         return fn_name, args
 
-    @staticmethod
-    def _is_complete(text: str) -> bool:
-        """Devuelve True si *text* es un JSON completo y válido."""
-        try:
-            json.loads(text)
-            return True
-        except json.JSONDecodeError:
-            return False
 
-    @staticmethod
-    def _extract_json(text: str) -> Dict[str, Any]:
-        """
-        Extrae el primer objeto JSON de *text*.
-        Si el JSON está truncado (falta uno o más '}'), intenta cerrarlo.
-        """
-        start = text.find("{")
-        if start == -1:
-            raise ValueError("No se encontró '{' en la salida generada.")
-
-        fragment = text[start:]
-
-        # Intento directo
-        try:
-            return json.loads(fragment)  # type: ignore[no-any-return]
-        except json.JSONDecodeError:
-            pass
-
-        # Cierra llaves abiertas que falten (hasta 3 niveles de profundidad)
-        depth = _count_open_braces(fragment)
-        for closing in range(1, depth + 1):
-            candidate = fragment + "}" * closing
-            try:
-                return json.loads(candidate)  # type: ignore[no-any-return]
-            except json.JSONDecodeError:
-                continue
-
-        # Último recurso: extrae hasta el último '}' presente
-        end = text.rfind("}")
-        if end == -1:
-            raise ValueError("No se encontró '}' en la salida generada.")
-        return json.loads(text[start: end + 1])  # type: ignore[no-any-return]
+# ── Module helpers ────────────────────────────────────────────────────────────
 
 
-def _count_open_braces(text: str) -> int:
-    """Cuenta cuántas llaves '{' están sin cerrar en text"""
-    depth = 0
-    in_string = False
-    escape = False
+def _closest(name: str, candidates: List[str]) -> str:
+    """Candidato con mayor solapamiento de prefijo con *name*."""
+    return max(candidates, key=lambda c: sum(a == b for a, b in zip(name, c)))
+
+
+def _extract_number(text: str) -> float:
+    """Extrae el primer float/int de *text*; devuelve 0.0 si no hay ninguno."""
+    buf = ""
     for ch in text:
-        if escape:
-            escape = False
-            continue
-        if ch == "\\" and in_string:
-            escape = True
-            continue
-        if ch == '"':
-            in_string = not in_string
-            continue
-        if in_string:
-            continue
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-    return max(depth, 0)
+        if ch.isdigit() or ch in (".", "-"):
+            buf += ch
+        elif buf:
+            break
+    try:
+        return float(buf)
+    except ValueError:
+        return 0.0

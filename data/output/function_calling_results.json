@@ -38,8 +38,10 @@
   },
   {
     "prompt": "Reverse the string 'world'",
-    "fn_name": "error",
-    "args": {}
+    "fn_name": "fn_reverse_string",
+    "args": {
+      "s": "world"
+    }
   },
   {
     "prompt": "What is the square root of 16?",
@@ -50,15 +52,17 @@
   },
   {
     "prompt": "Calculate the square root of 144",
-    "fn_name": "error",
-    "args": {}
+    "fn_name": "fn_get_square_root",
+    "args": {
+      "a": 144.0
+    }
   },
   {
     "prompt": "Replace all numbers in \"Hello 34 I'm 233 years old\" with NUMBERS",
     "fn_name": "fn_substitute_string_with_regex",
     "args": {
       "source_string": "Hello 34 I'm 233 years old",
-      "regex": "[0-9]+",
+      "regex": "([0-9]+)",
       "replacement": "NUMBERS"
     }
   },
@@ -67,8 +71,8 @@
     "fn_name": "fn_substitute_string_with_regex",
     "args": {
       "source_string": "Programming is fun",
-      "regex": "[aeiouAEIOU]",
-      "replacement": "*"
+      "regex": "aeiouAEIOU",
+      "replacement": " *"
     }
   },
   {
