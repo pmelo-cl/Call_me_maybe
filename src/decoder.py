@@ -1,5 +1,7 @@
-"""Generación guiada por fases: el modelo elige valores, nosotros construimos el JSON."""
-from typing import Any, Dict, List, Tuple
+"""Generación guiada por fases: el modelo elige valores, construimos el JSON."""
+import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -16,17 +18,37 @@ class ConstrainedDecoder:
         model: Any,
         vocab: Dict[int, str],
         functions: List[FunctionDefinition],
+        verbose: bool = False,
+        verbose_callback: Optional[Callable[[str], None]] = None,
+        cache_size: Optional[int] = 100,
     ) -> None:
         self.model = model
         self.vocab = vocab
         self.functions = functions
+        self.verbose = verbose
+        if verbose_callback is not None:
+            self._verbose_callback = verbose_callback
+        else:
+            self._verbose_callback = lambda msg: (
+                sys.stderr.write(msg + "\n") if verbose else None
+            )
+
         self._fn_by_name: Dict[str, FunctionDefinition] = {
             f.name: f for f in functions
         }
         self._static_prompt: str = self._build_static_prompt()
         self._prefix_ids: List[int] = self._encode_static_prompt()
 
-    # ── Prompt ───────────────────────────────────────────────────────────────
+        self._cache: Dict[str, Tuple[str, Dict[str, Any]]] = {}
+        self._cache_size = cache_size
+
+    def encode(self, text: str) -> List[int]:
+        """Expone la codificación del tokenizer subyacente."""
+        return self.model.encode(text)[0].tolist()  # type: ignore[no-any-return]
+
+    def decode(self, token_ids: List[int]) -> str:
+        """Decodifica una lista de IDs a texto usando el vocabulario."""
+        return "".join(self.vocab.get(tid, "") for tid in token_ids)
 
     def _build_static_prompt(self) -> str:
         func_lines = [
@@ -82,17 +104,11 @@ class ConstrainedDecoder:
         return f"Functions:\n{func_list}\n\nExamples:\n{ex_text}\n\nQ: "
 
     def _encode_static_prompt(self) -> List[int]:
-        """Codifica el prompt estático una vez y devuelve sus IDs."""
-        return self.model.encode(self._static_prompt)[0].tolist()
-
-    # ── Low-level helpers ─────────────────────────────────────────────────────
+        return self.encode(self._static_prompt)
 
     def _forward(
-        self,
-        ids: List[int],
-        pkv: Any,
+        self, ids: List[int], pkv: Any
     ) -> Tuple[npt.NDArray[np.float32], Any]:
-        """Forward pass sobre *ids* con KV-cache; devuelve logits y nuevo pkv."""
         tensor = torch.tensor(
             [ids], device=self.model._device, dtype=torch.long
         )
@@ -105,13 +121,8 @@ class ConstrainedDecoder:
         )
         return logits, out.past_key_values
 
-    def _inject(
-        self,
-        text: str,
-        pkv: Any,
-    ) -> Tuple[npt.NDArray[np.float32], Any]:
-        """Inyecta *text* como tokens forzados; devuelve logits del siguiente token."""
-        ids = self.model.encode(text)[0].tolist()
+    def _inject(self, text: str, pkv: Any) -> Tuple[npt.NDArray[np.float32], Any]:
+        ids = self.encode(text)
         return self._forward(ids, pkv)
 
     def _generate_until(
@@ -120,71 +131,83 @@ class ConstrainedDecoder:
         logits: npt.NDArray[np.float32],
         pkv: Any,
         max_tokens: int = 64,
+        context_name: str = "",
+        worker_id: int = 0,
     ) -> Tuple[str, npt.NDArray[np.float32], Any]:
-        """
-        Genera tokens hasta que *stop* aparezca en el texto acumulado.
-
-        El stop se busca token a token ANTES de añadir cada nuevo token
-        al buffer, para evitar que un token multi-carácter (p.ej. '"]')
-        oculte el stop y se incluya en el valor generado.
-
-        Devuelve el texto antes del stop, los últimos logits y el pkv.
-        """
         generated = ""
-        for _ in range(max_tokens):
+        for step in range(max_tokens):
             next_id = int(np.argmax(logits))
             token = self.vocab.get(next_id, "")
-
-            # Si el stop está dentro del token, añadimos solo lo previo al stop
+            if self.verbose and self._verbose_callback:
+                self._verbose_callback(
+                    f"[worker {worker_id}][{context_name}] paso {step+1}: "
+                    f"token='{token}' (id={next_id}) | acum='{generated}{token}'"
+                )
             combined = generated + token
             if stop in combined:
-                return combined[: combined.index(stop)], logits, pkv
-
+                result = combined[: combined.index(stop)]
+                if self.verbose and self._verbose_callback:
+                    self._verbose_callback(
+                        f"[worker {worker_id}][{context_name}] -> '{result}'"
+                    )
+                return result, logits, pkv
             generated = combined
             logits, pkv = self._forward([next_id], pkv)
-
+        if self.verbose and self._verbose_callback:
+            self._verbose_callback(
+                f"[worker {worker_id}][{context_name} incompleto] -> '{generated}'"
+            )
         return generated, logits, pkv
 
-    # ── Guided generation ─────────────────────────────────────────────────────
-
-    def generate(
+    def _generate_single(
         self,
         user_prompt: str,
         max_value_tokens: int = 64,
+        use_cache: bool = True,
+        worker_id: int = 0,
     ) -> Tuple[str, Dict[str, Any]]:
-        """
-        Generación guiada por fases.
+        if use_cache and user_prompt in self._cache:
+            if self.verbose and self._verbose_callback:
+                self._verbose_callback(
+                    f"[worker {worker_id}] cache hit '{user_prompt}'"
+                )
+            return self._cache[user_prompt]
 
-        Reconstruye el contexto completo desde el prefijo estático en cada llamada,
-        evitando problemas de mutabilidad del KV-cache entre prompts distintos.
-        """
-        # 1. Construir la secuencia completa de IDs del prefijo + usuario + inicio JSON
         suffix = user_prompt + f'\nA: {_JSON_PREFIX} '
-        full_ids = self._prefix_ids + self.model.encode(suffix)[0].tolist()
-
-        # 2. Forward inicial sin KV-cache (past_key_values=None)
+        full_ids = self._prefix_ids + self.encode(suffix)
         logits, pkv = self._forward(full_ids, None)
 
-        # ── Fase 1: nombre de la función ──────────────────────────────────────
-        fn_raw, logits, pkv = self._generate_until('"', logits, pkv)
+        fn_raw, logits, pkv = self._generate_until(
+            '"', logits, pkv, context_name="nombre_función",
+            worker_id=worker_id
+        )
         fn_name = fn_raw.strip()
 
         if fn_name not in self._fn_by_name:
-            fn_name = _closest(fn_name, list(self._fn_by_name.keys()))
+            if self.verbose and self._verbose_callback:
+                self._verbose_callback(
+                    f"[worker {worker_id}] recuperación nombre '{fn_name}' "
+                    "no encontrado"
+                )
+            corrected = _closest(fn_name, list(self._fn_by_name.keys()))
+            if corrected and corrected in self._fn_by_name:
+                fn_name = corrected
+            else:
+                raise ValueError(f"Función no reconocida: '{fn_name}'")
 
         fn_def = self._fn_by_name[fn_name]
         param_keys = list(fn_def.parameters.keys())
 
         if not param_keys:
-            return fn_name, {}
+            result: Tuple[str, Dict[str, Any]] = (fn_name, {})
+            if use_cache:
+                self._update_cache(user_prompt, result)
+            return result
 
-        # ── Fase 2: valores de los argumentos ─────────────────────────────────
         args: Dict[str, Any] = {}
-
         for i, key in enumerate(param_keys):
             param_type = fn_def.parameters[key].type
             is_last = i == len(param_keys) - 1
-
             if i == 0:
                 scaffold = f'", "args": {{"{key}": '
             else:
@@ -194,34 +217,87 @@ class ConstrainedDecoder:
             if param_type == "number":
                 stop_char = "}" if is_last else ","
                 value_str, logits, pkv = self._generate_until(
-                    stop_char, logits, pkv, max_tokens=max_value_tokens
+                    stop_char, logits, pkv, max_value_tokens,
+                    f"arg {key} (num)", worker_id
                 )
                 clean = value_str.strip().rstrip("},").strip()
                 try:
                     args[key] = float(clean)
                 except ValueError:
-                    args[key] = _extract_number(clean)
+                    recovered = _extract_number(clean)
+                    if self.verbose and self._verbose_callback:
+                        self._verbose_callback(
+                            f"[worker {worker_id}] parseo '{clean}' -> {recovered}"
+                        )
+                    args[key] = recovered
             else:
-                # Strings: inyectamos '"' de apertura; el modelo genera hasta '"'
                 logits, pkv = self._inject('"', pkv)
                 value_str, logits, pkv = self._generate_until(
-                    '"', logits, pkv, max_tokens=max_value_tokens
+                    '"', logits, pkv, max_value_tokens,
+                    f"arg {key} (str)", worker_id
                 )
                 args[key] = value_str
 
-        return fn_name, args
+        result = (fn_name, args)
+        if use_cache:
+            self._update_cache(user_prompt, result)
+        return result
 
+    def generate(
+        self,
+        user_prompt: str,
+        max_value_tokens: int = 64,
+        use_cache: bool = True,
+    ) -> Tuple[str, Dict[str, Any]]:
+        """Generación guiada para un solo prompt."""
+        return self._generate_single(user_prompt, max_value_tokens, use_cache)
 
-# ── Module helpers ────────────────────────────────────────────────────────────
+    def generate_batch(
+        self,
+        prompts: List[str],
+        max_value_tokens: int = 64,
+        use_cache: bool = True,
+        max_workers: int = 4,
+        progress_callback: Optional[
+            Callable[[int, str, Tuple[str, Dict[str, Any]], int], None]
+        ] = None,
+    ) -> List[Tuple[str, Dict[str, Any]]]:
+        results: List[Optional[Tuple[str, Dict[str, Any]]]] = [None] * len(prompts)
+
+        def _worker(
+            idx: int, prompt: str, wid: int
+        ) -> Tuple[int, int, Tuple[str, Dict[str, Any]]]:
+            return idx, wid, self._generate_single(
+                prompt, max_value_tokens, use_cache, wid
+            )
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {}
+            next_wid = 0
+            for i, p in enumerate(prompts):
+                wid = next_wid % max_workers
+                next_wid += 1
+                futures[executor.submit(_worker, i, p, wid)] = (i, wid)
+            for future in as_completed(futures):
+                idx, wid, result = future.result()
+                results[idx] = result
+                if progress_callback:
+                    progress_callback(idx, prompts[idx], result, wid)
+
+        return [r for r in results if r is not None]
+
+    def _update_cache(self, prompt: str, result: Tuple[str, Dict[str, Any]]) -> None:
+        if self._cache_size is not None and len(self._cache) >= self._cache_size:
+            oldest = next(iter(self._cache.keys()))
+            del self._cache[oldest]
+        self._cache[prompt] = result
 
 
 def _closest(name: str, candidates: List[str]) -> str:
-    """Candidato con mayor solapamiento de prefijo con *name*."""
     return max(candidates, key=lambda c: sum(a == b for a, b in zip(name, c)))
 
 
 def _extract_number(text: str) -> float:
-    """Extrae el primer float/int de *text*; devuelve 0.0 si no hay ninguno."""
     buf = ""
     for ch in text:
         if ch.isdigit() or ch in (".", "-"):
