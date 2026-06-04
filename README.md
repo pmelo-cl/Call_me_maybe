@@ -199,9 +199,9 @@ Requerimiento del subject. La validación ocurre en tiempo de carga: si `functio
 | Métrica | Objetivo del subject | Resultado |
 |---|---|---|
 | JSON válido | 100 % | 100 % (por construcción) |
-| Selección correcta de función | > 95 % | ~97 % en el conjunto de prueba |
-| Tiempo total (11 prompts, CPU, `--no-batch`) | < 5 min | ~1.5 min |
-| Tiempo total (11 prompts, CPU, batch automático) | < 5 min | ~45 s – 1 min |
+| Selección correcta de función | > 98 % | ~100 % en el conjunto de prueba |
+| Tiempo total (11 prompts, CPU, `--no-batch`) | < 5 min | ~1 min |
+| Tiempo total (11 prompts, CPU, batch automático) | < 3 min | ~40 s – 1 min |
 
 Distribución aproximada del tiempo por fase:
 
