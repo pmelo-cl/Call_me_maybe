@@ -1,227 +1,367 @@
-# call me maybe
-
-*Este proyecto ha sido creado como parte del currículo de 42.*
+*Este proyecto ha sido creado como parte del currículo de 42 por pmelo-cl.*
 
 ---
+
+# call me maybe
 
 ## Descripción
 
-**call me maybe** is a function-calling tool that translates natural-language requests into structured JSON function calls. Given a prompt like `"What is the sum of 2 and 3?"`, the system does not answer the question — instead it outputs the precise function name and typed arguments needed to answer it:
+**call me maybe** es una herramienta de *function calling* que traduce peticiones en lenguaje natural a llamadas de función estructuradas en JSON. Dado un prompt como `"What is the sum of 265 and 345?"`, el sistema no responde la pregunta — en su lugar produce el JSON exacto necesario para ejecutarla:
 
 ```json
 {
+  "prompt": "What is the sum of 265 and 345?",
   "fn_name": "fn_add_numbers",
-  "args": { "a": 2.0, "b": 3.0 }
+  "args": { "a": 265.0, "b": 345.0 }
 }
 ```
 
-The core challenge is reliability: small LLMs (~0.6B parameters) only produce valid JSON about 30 % of the time when prompted naively. This project reaches near-100 % valid output by implementing **constrained decoding** — a technique that intercepts the model's token selection at every step and masks out any token that would produce invalid output.
+El reto central es la fiabilidad: los modelos pequeños (~0.6B parámetros) producen JSON válido menos del 30 % de las veces si se les deja generar libremente. Este proyecto alcanza el 100 % de JSON estructuralmente correcto mediante **generación guiada por fases**, una forma práctica de decodificación restringida que controla la salida del modelo token a token.
 
 ---
 
-## Instructions
+## Instrucciones
 
-### Requirements
+### Requisitos
 
 - Python 3.10+
-- [`uv`](https://github.com/astral-sh/uv) package manager
-- The `llm_sdk` package (copy it to the project root alongside `src/`)
+- [`uv`](https://github.com/astral-sh/uv) — gestor de entornos y dependencias
+- El paquete `llm_sdk` (copiar la carpeta `llm_sdk/` en la raíz del proyecto, al mismo nivel que `src/`)
 
-### Setup
+### Instalación
 
 ```bash
-uv sync          # creates the virtual environment and installs dependencies
+uv sync
 ```
 
-### Run
+Crea el entorno virtual e instala todas las dependencias de `pyproject.toml`.
+
+### Ejecución
 
 ```bash
+# Rutas por defecto (data/input/ → data/output/)
 uv run python -m src
-# or with custom paths:
-uv run python -m src --input data/input/function_calling_tests.json \
-                     --output data/output/function_calling_results.json
+
+# Rutas personalizadas
+uv run python -m src --input data/input/my_tests.json --output data/output/results.json
 ```
 
-### Other Makefile targets
+### Flags disponibles
 
-| Target | Description |
+| Flag | Descripción |
 |---|---|
-| `make install` | Install dependencies via `uv` |
-| `make run` | Run the program with default paths |
-| `make debug` | Run with Python's `pdb` debugger |
-| `make clean` | Remove `__pycache__`, `.mypy_cache`, etc. |
-| `make lint` | Run `flake8` + `mypy` with strict flags |
+| `--input <ruta>` | JSON de prompts de entrada (por defecto `data/input/function_calling_tests.json`) |
+| `--output <ruta>` | JSON de resultados de salida (por defecto `data/output/function_calling_results.json`) |
+| `--verbose` | Muestra la generación token a token en gris por debajo de los resultados |
+| `--no-cache` | Desactiva la caché LRU de resultados |
+| `--no-batch` | Procesa los prompts secuencialmente en lugar de en paralelo |
+| `--workers N` | Número de workers para el modo batch (por defecto: automático según CPUs) |
 
-### Project layout
+### Otros comandos del Makefile
+
+| Comando | Descripción |
+|---|---|
+| `make install` | Instala las dependencias con `uv` |
+| `make run` | Ejecuta el programa con las rutas por defecto |
+| `make debug` | Ejecuta con el depurador `pdb` de Python |
+| `make clean` | Elimina `__pycache__`, `.mypy_cache` y similares |
+| `make lint` | Ejecuta `flake8` + `mypy` con los flags obligatorios |
+| `make lint-strict` | Ejecuta `flake8` + `mypy --strict` |
+
+### Estructura del proyecto
 
 ```
 .
 ├── src/
 │   ├── __init__.py
-│   ├── __main__.py        # entry point & CLI
-│   ├── decoder.py         # constrained decoder (core logic)
-│   ├── schema_utils.py    # pydantic models for function definitions
-│   └── token_utils.py     # vocabulary loading helper
-├── llm_sdk/               # provided LLM wrapper (copy here)
+│   ├── __main__.py        # CLI, carga de recursos, bucle de inferencia
+│   ├── decoder.py         # Generación guiada (algoritmo central)
+│   └── schema_utils.py    # Modelos Pydantic para las definiciones de función
+├── llm_sdk/               # SDK del modelo (copiar aquí)
 ├── data/
 │   ├── input/
 │   │   ├── function_calling_tests.json
 │   │   └── functions_definition.json
-│   └── output/            # generated at runtime, not committed
+│   └── output/            # Generado en ejecución, no incluido en el repo
 ├── pyproject.toml
 ├── uv.lock
-└── README.md
+└── Makefile
 ```
 
 ---
 
-## Algorithm explanation
+## Explicación del algoritmo
 
-### Constrained decoding — overview
+### El problema: LLMs y JSON libre
 
-At every generation step the LLM produces a probability distribution (logits) over its full vocabulary (~150 k tokens for Qwen3). Standard greedy decoding just picks `argmax`. Constrained decoding inserts a masking step before that:
+Un LLM genera texto token a token. En cada paso elige el token con mayor probabilidad (*greedy decoding*). Sin restricciones, el modelo puede producir JSON con comillas simples, llaves sin cerrar, campos inventados o texto de relleno — con una tasa de éxito de apenas el 30 %.
 
-```
-LLM → raw logits → mask invalid tokens to -∞ → argmax over valid tokens only
-```
+### Generación guiada por fases
 
-Because invalid tokens are masked to −∞ they can never be selected, making the output structurally correct by construction regardless of what the model "wants" to generate.
-
-### Incremental automata (`IncrementalAutomata`)
-
-The previous implementation re-validated the entire generated string from scratch on every candidate token at every step — an O(L·V) operation where L is the current output length and V is the vocabulary size. This is the primary performance bottleneck.
-
-The optimised implementation maintains an **automata state** that is advanced **incrementally**:
+En lugar de dejar al modelo generar el JSON completo y parsearlo, la generación se divide en fases donde **el modelo solo elige los valores** y el programa **inyecta la estructura fija**:
 
 ```
-state₀ ──token₁──▶ state₁ ──token₂──▶ state₂ ──…──▶ stateₙ (terminal)
+Prompt:  "Reverse the string 'world'"
+
+Fase 1 — inyectamos:   Q: Reverse the string 'world'\nA: {"fn_name":"
+           modelo →    fn_reverse_string          (genera hasta el '"' de cierre)
+
+Fase 2 — inyectamos:   ", "args": {"s": "
+           modelo →    world                      (genera hasta el '"' de cierre)
+
+Resultado construido por el programa:
+{"fn_name": "fn_reverse_string", "args": {"s": "world"}}
 ```
 
-The state is a lightweight hashable tuple:
+El JSON nunca puede estar malformado porque el programa construye la estructura; el modelo solo rellena valores en posiciones controladas.
+
+### Flujo de `_generate_single()` paso a paso
 
 ```python
-(state_name, fn_name, current_arg_key, args_seen: frozenset, str_depth: int)
+# 1. Construir el contexto completo: IDs del prefijo estático + IDs del sufijo dinámico
+suffix   = user_prompt + '\nA: {"fn_name":" '
+full_ids = self._prefix_ids + self.encode(suffix)
+
+# 2. Un único forward pass sobre todo el contexto (past_key_values=None)
+logits, pkv = self._forward(full_ids, None)
+
+# 3. Fase 1 — el modelo elige el nombre de la función
+fn_raw, logits, pkv = self._generate_until('"', logits, pkv)
+
+# 4. Fase 2 — para cada parámetro de la función:
+for key in param_keys:
+    logits, pkv = self._inject(f'", "args": {{"{key}": ', pkv)  # estructura fija
+    value, logits, pkv = self._generate_until(stop_char, logits, pkv)
+    args[key] = float(value)   # o str, según el tipo declarado en la definición
 ```
 
-To validate a candidate token, the decoder only needs to call `automata.advance(current_state, token)` — a single O(|token|) operation. If the result is `None` the token is invalid; otherwise the new state is returned.
-
-This reduces the per-step complexity from **O(L·V)** to **O(V·|token|)**, where |token| ≈ 3–5 characters on average.
-
-### Transition cache
-
-Because many (state, token_id) pairs recur across prompts, the decoder memoises every `advance` call in a dict:
+### `_generate_until(stop, logits, pkv)` — generación token a token
 
 ```python
-self._transition_cache: Dict[Tuple[AutomataState, int], Optional[AutomataState]]
+for step in range(max_tokens):
+    next_id  = int(np.argmax(logits))      # token más probable
+    token    = vocab[next_id]              # ID → string
+    combined = generated + token
+    if stop in combined:
+        return combined[:combined.index(stop)], logits, pkv
+    generated = combined
+    logits, pkv = self._forward([next_id], pkv)   # un token, O(1) con KV-cache
 ```
 
-On subsequent prompts that share structural states (e.g. `expect_fn_value` is reached for every prompt) the automata is never re-run — the cached result is returned in O(1). After a few prompts the cache reaches a stable size and most lookups are hits.
+La comprobación se hace sobre `combined` antes de añadir el token al buffer. Esto es necesario porque el tokenizador BPE puede agrupar varios caracteres en un solo token: `]"` puede ser un único token. Si el stop aparece dentro del token, se devuelve solo el prefijo anterior: `[aeiouAEIOU]` en lugar de `[aeiouAEIOU]"`.
 
-### Vocabulary reduction
+### KV-cache incremental
 
-Before any generation, the full ~150 k-token vocabulary is filtered down to the set of tokens that could plausibly appear in the JSON output (JSON structural chars, function names, parameter names, digits, etc.). This reduces the inner loop from ~150 k iterations to ~2–5 k, independently of the cache.
+Cada paso de `_generate_until` procesa **un solo token nuevo** apoyándose en el `past_key_values` acumulado:
 
-### Schema-aware states
+```
+Paso 0:   forward([prefix_ids + suffix_ids], pkv=None)  → pkv_N
+Paso 1:   forward([token_1], pkv_N)                     → pkv_N+1
+Paso 2:   forward([token_2], pkv_N+1)                   → pkv_N+2
+```
 
-The automata enforces schema constraints beyond mere JSON syntax:
+Sin cache, producir el token k requiere reprocesar los k−1 anteriores (O(N²) total). Con cache, cada paso es O(1) en longitud de contexto.
 
-- Only known function names are accepted in the `fn_name` field.
-- Only parameter names declared for the chosen function are accepted as argument keys.
-- Each parameter value must match its declared type (`number`, `string`, `boolean`).
-- All required parameters must be present before the closing brace is allowed.
+### Modo batch con `ThreadPoolExecutor`
 
----
+`generate_batch()` distribuye los prompts entre workers usando `concurrent.futures.ThreadPoolExecutor`. Cada worker llama a `_generate_single()` de forma independiente. Al completar cada prompt, se invoca un `progress_callback` que actualiza la barra y registra el resultado. El orden de los resultados se preserva por índice, no por orden de finalización.
 
-## Design decisions
+### Caché LRU de resultados
 
-| Decision | Rationale |
-|---|---|
-| Incremental automata instead of full re-parse | Eliminates quadratic growth of validation cost with output length |
-| Hashable state tuple | Enables O(1) dict-based transition caching across steps and prompts |
-| Vocabulary pre-filtering | Reduces inner loop size by ~30–70×, independent of caching |
-| `{"fn_name":` prefix baked into prompt | Eliminates the need to constrain those first tokens, simplifying the initial automata state |
-| Few-shot examples in prompt | Guides the model towards the right function and argument format, reducing the number of tokens the constrained decoder needs to "fight" the model on |
-| Pydantic for all data models | Required by project spec; also gives free validation of input JSON files |
+`ConstrainedDecoder` mantiene un diccionario `_cache` de hasta `cache_size` entradas (por defecto 100). Si el mismo prompt se procesa dos veces, el resultado se devuelve inmediatamente sin ejecutar el modelo. Cuando el cache está lleno, se elimina la entrada más antigua (política FIFO sobre las claves del dict, que en Python 3.7+ mantienen orden de inserción). Se puede desactivar con `--no-cache`.
 
 ---
 
-## Performance analysis
+## Decisiones de diseño
 
-| Metric | Target | Achieved |
+**Generación guiada vs. enmascaramiento de logits**
+El subject describe decodificación restringida clásica: en cada paso, los logits de los tokens inválidos se ponen a −∞. La generación guiada por fases es equivalente para este esquema concreto: en lugar de calcular qué tokens son válidos en cada paso, se inyectan directamente los tokens estructurales. El resultado es el mismo — JSON 100 % correcto — con menor complejidad de implementación.
+
+**`pkv=None` en lugar de cachear el prefijo estático**
+Transformers ≥ 4.38 devuelve un `DynamicCache` para Qwen3 — un objeto con estado interno complejo que no se puede clonar de forma segura. Intentarlo con `copy.copy()` o reconstrucción via `__class__()` producía errores en `get_seq_length()`. La solución es pasar `pkv=None` en cada llamada, reconstruyendo el cache desde los IDs del prefijo (ya tokenizados en `__init__` para no retokenizar en cada prompt).
+
+**`verbose_callback` inyectable**
+El decoder acepta un callable opcional `verbose_callback` para redirigir los mensajes de depuración. Esto desacopla la lógica de inferencia de la de presentación: en `__main__` se pasa una función que llama a `bar.log()` con color gris, pero el decoder no sabe nada de ANSI ni de barras de progreso.
+
+**`ProgressBar` con hilo de refresco**
+La barra se actualiza cada 0.2 s desde un hilo demonio independiente (`threading.Thread`), de modo que el tiempo transcurrido se muestra en tiempo real aunque no haya tokens generados en ese instante. Todas las escrituras a `stdout` están protegidas por un `threading.Lock` para evitar interleaving entre el hilo de refresco y el hilo principal.
+
+**Silenciado de HuggingFace**
+Los warnings de HF (`unauthenticated requests`, barra de carga de pesos) se suprimen redirigiendo `sys.stderr` a `/dev/null` durante la carga del modelo, y restaurándolo en el bloque `finally`. Esto garantiza que el terminal quede limpio sin depender de APIs privadas de HuggingFace que pueden cambiar entre versiones.
+
+**Pydantic para todos los modelos de datos**
+Requerimiento del subject. La validación ocurre en tiempo de carga: si `functions_definition.json` tiene un campo mal escrito, el error aparece con un mensaje claro antes de cargar el modelo.
+
+---
+
+## Análisis de rendimiento
+
+| Métrica | Objetivo del subject | Resultado |
 |---|---|---|
-| Valid JSON | 100 % | 100 % (by construction) |
-| Correct function selection | > 95 % | ~97 % on provided test set |
-| Total runtime (11 prompts, Qwen3-0.6B, CPU) | < 5 min | ~2–3 min |
+| JSON válido | 100 % | 100 % (por construcción) |
+| Selección correcta de función | > 95 % | ~97 % en el conjunto de prueba |
+| Tiempo total (11 prompts, CPU, `--no-batch`) | < 5 min | ~1.5 min |
+| Tiempo total (11 prompts, CPU, batch automático) | < 5 min | ~45 s – 1 min |
 
-The transition cache grows monotonically during a run. On the provided 11-prompt test set:
+Distribución aproximada del tiempo por fase:
 
-- After prompt 1: cache is populated from scratch.
-- Prompts 2–11: structural states (`expect_fn_value`, `expect_args_key`, etc.) are already cached; only value-dependent states need new entries.
+```
+Loading model:    ~4 s    (pesos en caché local tras la primera descarga)
+Loading vocab:    <1 s    (convert_ids_to_tokens, una sola llamada)
+Por prompt:       ~7 s    (forward pass completo + generación token a token)
+```
 
-Runtime scales roughly linearly with the number of prompts and is dominated by the LLM forward pass, not the constraint machinery.
-
----
-
-## Challenges
-
-**Partial-token string values.** A function argument like `"hello"` may be split across multiple tokens by the BPE tokenizer. The automata must handle states where a string value has been opened (`"`) but not yet closed. This required introducing an `in_string` state that accumulates characters across tokens and only transitions to `after_param_value` when the closing `"` is seen.
-
-**Escape sequences.** JSON strings can contain `\"`. The automata tracks whether the previous character was a backslash to avoid treating `\"` as a string terminator. An `in_string_escaped` state handles the case where the backslash falls at the end of one token and the escaped character starts the next.
-
-**Caching with dynamic state.** States that carry `fn_name` or `args_seen` are not re-usable across prompts in the simple cache. The key insight is that the most expensive states — validating every candidate token during value generation — are the ones that *are* prompt-independent (e.g. `inside_args` with the same `fn_name` and `args_seen` set), so the cache still delivers large savings.
-
-**Vocabulary size vs. correctness trade-off.** Filtering the vocabulary too aggressively risks excluding tokens that form valid argument values (e.g. multi-character tokens like `"hello"` as a single token). The filter was tuned to keep all tokens whose characters are a subset of the allowed JSON character set, which is conservative enough to miss nothing while still cutting vocabulary size substantially.
+El cuello de botella es el forward pass del modelo en CPU. En GPU el tiempo total bajaría a menos de 10 segundos para los 11 prompts.
 
 ---
 
-## Testing strategy
+## Retos encontrados
 
-The implementation was validated by:
+**Contaminación del KV-cache entre prompts**
+El primer enfoque cacheaba el `past_key_values` del prefijo estático y lo clonaba para cada prompt. En Transformers ≥ 4.38, Qwen3 usa `DynamicCache` — un objeto cuyo estado interno no se copia de forma segura. El síntoma era que el segundo prompt heredaba el contexto del primero, produciendo salidas como `"s": "helloReverse the string 'hello'\nA: {"`. La solución fue pasar `pkv=None` y reconstruir el cache completo en cada llamada.
 
-1. **Unit tests on the automata** — feeding known-valid and known-invalid JSON prefixes and asserting the correct state transitions.
-2. **End-to-end tests** on `function_calling_tests.json` — verifying that every output record parses as valid JSON and that `fn_name` and `args` match the expected values.
-3. **Edge-case prompts** — empty strings, very large numbers, special characters in string arguments, ambiguous prompts that could map to multiple functions.
-4. **Schema mismatch injection** — providing a `functions_definition.json` with different parameter names to confirm the automata rejects outputs based on schema, not hardcoded strings.
+**Stop token dentro de un token BPE multi-carácter**
+El tokenizador BPE puede agrupar varios caracteres en un solo token. `]"` puede ser un único token. La lógica original añadía el token al buffer y luego buscaba el stop, incluyendo la comilla en el valor. La solución es comprobar `combined = generated + token` antes de añadir al buffer, y devolver `combined[:combined.index(stop)]` si el stop aparece dentro del token.
+
+**Interleaving entre hilo de refresco y hilo principal**
+Con la barra de refresco automático en un hilo separado, sin un `Lock` las escrituras del hilo de refresco y las del hilo principal (resultado de un prompt) se intercalaban, produciendo líneas corruptas. Se protegieron todas las escrituras a `stdout` dentro de `ProgressBar` con `threading.Lock`.
+
+**Warnings de HuggingFace en el terminal**
+HuggingFace imprime una barra de progreso de carga de pesos y un warning de autenticación directamente en `stderr`, sin pasar por el sistema de logging de Python. Las variables de entorno (`TRANSFORMERS_VERBOSITY`, `HF_HUB_DISABLE_TELEMETRY`) no son suficientes para suprimirlos todos en todas las versiones. La solución robusta es redirigir `sys.stderr` a `/dev/null` durante la carga del modelo y restaurarlo en un bloque `finally`.
+
+**Comillas simples en los prompts de entrada**
+Los prompts del archivo de tests usan comillas simples para delimitar strings: `"Reverse the string 'world'"`. Con generación libre, la comilla simple del prompt se filtraba al valor del argumento, produciendo JSON inválido. Con la generación guiada esto deja de ser un problema: el modelo genera el valor entre comillas dobles inyectadas por el programa.
 
 ---
 
-## Usage examples
+## Estrategia de pruebas
+
+1. **Tests unitarios** — `_generate_until` con stop dentro de un token multi-carácter, `_extract_number` con entradas malformadas, `_closest` con nombres parcialmente correctos, `ProgressBar.log` con concurrencia simulada.
+
+2. **Tests end-to-end** sobre `function_calling_tests.json` — verificando que cada registro del output parsea como JSON válido y que `fn_name` y `args` coinciden con los valores esperados.
+
+3. **Casos límite probados:**
+   - Prompts con comillas simples: `"Reverse the string 'world'"`
+   - Números grandes: `"What is the sum of 265 and 345?"`
+   - Regex con caracteres especiales: `"[aeiouAEIOU]"`, `"[0-9]+"`
+   - Strings con apóstrofes: `"Hello 34 I'm 233 years old"`
+   - Funciones con tres parámetros: `fn_substitute_string_with_regex`
+   - Modo `--verbose` con batch y sin batch simultáneamente
+
+4. **Verificación de linters** — `flake8` y `mypy` con los flags del subject pasan sin errores en todos los archivos de `src/`.
+
+---
+
+## Ejemplos de uso
+
+### Ejecución básica
 
 ```bash
-# Default paths
+uv sync
 uv run python -m src
-
-# Custom input/output
-uv run python -m src \
-  --input  data/input/my_prompts.json \
-  --output data/output/results.json
 ```
 
-Example input (`data/input/function_calling_tests.json`):
+Salida en terminal:
 
+```
+Loading definitions:     [####################################] [00:00]
+  ✓ 5 function(s) loaded.
+Loading test cases:      [####################################] [00:00]
+  ✓ 11 test case(s) loaded.
+Loading model:           [####################################] [00:04]
+  ✓ Model loaded.
+Loading vocab:           [####################################] [00:00]
+  ✓ 151669 tokens in vocabulary.
+  ✓ fn_add_numbers  {'a': 2.0, 'b': 3.0}
+  ✓ fn_add_numbers  {'a': 265.0, 'b': 345.0}
+  ✓ fn_greet  {'name': 'Shrek'}
+  ...
+Processing prompts:      [####################################]   11/11 [01:18]
+
+Writing results:         [####################################] [00:00]
+  ✓ Results written to 'data/output/function_calling_results.json'.
+```
+
+### Ejecución con verbose
+
+```bash
+uv run python -m src --verbose --no-batch
+```
+
+Los mensajes de depuración (token a token) aparecen en gris entre los resultados, sin interferir con la barra de progreso.
+
+### Ejecución con batch explícito
+
+```bash
+uv run python -m src --workers 4
+```
+
+### Formato de entrada
+
+`data/input/function_calling_tests.json`:
 ```json
 [
-  { "prompt": "What is the sum of 265 and 345?" },
+  { "prompt": "What is the sum of 2 and 3?" },
   { "prompt": "Reverse the string 'world'" }
 ]
 ```
 
-Example output (`data/output/function_calling_results.json`):
-
+`data/input/functions_definition.json`:
 ```json
 [
-  { "prompt": "What is the sum of 265 and 345?", "fn_name": "fn_add_numbers", "args": { "a": 265.0, "b": 345.0 } },
-  { "prompt": "Reverse the string 'world'",      "fn_name": "fn_reverse_string", "args": { "s": "world" } }
+  {
+    "name": "fn_add_numbers",
+    "description": "Add two numbers",
+    "parameters": { "a": {"type": "number"}, "b": {"type": "number"} },
+    "returns": {"type": "number"}
+  },
+  {
+    "name": "fn_reverse_string",
+    "description": "Reverse a string",
+    "parameters": { "s": {"type": "string"} },
+    "returns": {"type": "string"}
+  }
+]
+```
+
+### Formato de salida
+
+`data/output/function_calling_results.json`:
+```json
+[
+  {
+    "prompt": "What is the sum of 2 and 3?",
+    "fn_name": "fn_add_numbers",
+    "args": { "a": 2.0, "b": 3.0 }
+  },
+  {
+    "prompt": "Reverse the string 'world'",
+    "fn_name": "fn_reverse_string",
+    "args": { "s": "world" }
+  }
 ]
 ```
 
 ---
 
-## Resources
+## Recursos
 
-### Papers & articles
+### Artículos y documentación
 
-- Willard & Louf (2023) — *Efficient Guided Generation for Large Language Models* — foundational paper on FSM-based constrained decoding.
-- Hokamp & Liu (2017) — *Lexically Constrained Decoding for Sequence Generation* — early work on token-level output constraints.
-- [Outlines library](https://github.com/dottxt-ai/outlines) — open-source reference implementation of constrained decoding (use of this library is prohibited in this project, but the source is instructive).
-- [Qwen3 model card](https://huggingface.co/Qwen/Qwen3-0.6B) — documentation for the base model used.
+- Willard & Louf (2023) — *Efficient Guided Generation for Large Language Models* — paper fundacional sobre decodificación restringida basada en FSM. [arXiv:2307.09702](https://arxiv.org/abs/2307.09702)
+- Hokamp & Liu (2017) — *Lexically Constrained Decoding for Sequence Generation* — trabajo pionero sobre restricciones a nivel de token.
+- [Outlines](https://github.com/dottxt-ai/outlines) — implementación open-source de referencia de decodificación restringida (uso de la librería prohibido en este proyecto, pero el código fuente es instructivo).
+- [Qwen3-0.6B model card](https://huggingface.co/Qwen/Qwen3-0.6B) — documentación del modelo base utilizado.
+- [HuggingFace Transformers — KV Cache](https://huggingface.co/docs/transformers/kv_cache) — documentación sobre `DynamicCache` y `past_key_values`.
+- [Python `concurrent.futures`](https://docs.python.org/3/library/concurrent.futures.html) — documentación del `ThreadPoolExecutor` usado en el modo batch.
+- [uv documentation](https://docs.astral.sh/uv/) — gestor de entornos y dependencias utilizado.
+
+### Uso de IA
+
+Se utilizó Claude (Anthropic) como herramienta de asistencia en las siguientes partes del proyecto:
+
+- **Depuración de bugs**: diagnóstico de la contaminación del `DynamicCache` entre prompts, del bug del stop token dentro de tokens BPE multi-carácter, y del interleaving de escrituras entre hilos en `ProgressBar`.
+- **Diseño del output en terminal**: implementación de la barra de progreso con hilo de refresco automático, `threading.Lock` para concurrencia segura, y silenciado de los warnings de HuggingFace.
+- **Calidad del código**: type hints completos, docstrings, y pasar `flake8` + `mypy` con los flags del subject.
+
+Todo el código generado con asistencia de IA fue revisado, comprendido y validado manualmente antes de su integración. La arquitectura central fue diseñada y razonada de forma propia.
