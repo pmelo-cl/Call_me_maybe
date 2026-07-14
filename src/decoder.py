@@ -1,4 +1,3 @@
-"""Generación guiada por fases: el modelo elige valores, construimos el JSON."""
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -26,12 +25,16 @@ class ConstrainedDecoder:
         self.vocab = vocab
         self.functions = functions
         self.verbose = verbose
+        self._verbose_callback: Callable[[str], None]
+
         if verbose_callback is not None:
             self._verbose_callback = verbose_callback
         else:
-            self._verbose_callback = lambda msg: (
-                sys.stderr.write(msg + "\n") if verbose else None
-            )
+            def _default_verbose(msg: str) -> None:
+                if verbose:
+                    sys.stderr.write(msg + "\n")
+
+            self._verbose_callback = _default_verbose
 
         self._fn_by_name: Dict[str, FunctionDefinition] = {
             f.name: f for f in functions
@@ -44,7 +47,7 @@ class ConstrainedDecoder:
 
     def encode(self, text: str) -> List[int]:
         """Expone la codificación del tokenizer subyacente."""
-        return self.model.encode(text)[0].tolist()  # type: ignore[no-any-return]
+        return [int(x) for x in self.model.encode(text)[0].tolist()]
 
     def decode(self, token_ids: List[int]) -> str:
         """Decodifica una lista de IDs a texto usando el vocabulario."""
@@ -73,10 +76,10 @@ class ConstrainedDecoder:
                 '{"fn_name": "fn_get_square_root", "args": {"a": 16.0}}',
             ),
             (
-                'Replace all numbers in "Hello 34 Im 233 years old" with NUMBERS',
+                'Replace all numbers in "Hello 3 Im 2 years old" with NUMBERS',
                 (
                     '{"fn_name": "fn_substitute_string_with_regex",'
-                    ' "args": {"source_string": "Hello 34 Im 233 years old",'
+                    ' "args": {"source_string": "Hello 3 Im 2 years old",'
                     ' "regex": "[0-9]+", "replacement": "NUMBERS"}}'
                 ),
             ),
@@ -121,7 +124,8 @@ class ConstrainedDecoder:
         )
         return logits, out.past_key_values
 
-    def _inject(self, text: str, pkv: Any) -> Tuple[npt.NDArray[np.float32], Any]:
+    def _inject(self, text: str,
+                pkv: Any) -> Tuple[npt.NDArray[np.float32], Any]:
         ids = self.encode(text)
         return self._forward(ids, pkv)
 
@@ -138,24 +142,26 @@ class ConstrainedDecoder:
         for step in range(max_tokens):
             next_id = int(np.argmax(logits))
             token = self.vocab.get(next_id, "")
-            if self.verbose and self._verbose_callback:
+            if self.verbose:
                 self._verbose_callback(
                     f"[worker {worker_id}][{context_name}] paso {step+1}: "
-                    f"token='{token}' (id={next_id}) | acum='{generated}{token}'"
+                    f"token='{token}' (id={next_id}) "
+                    f" | acum='{generated}{token}'"
                 )
             combined = generated + token
             if stop in combined:
                 result = combined[: combined.index(stop)]
-                if self.verbose and self._verbose_callback:
+                if self.verbose:
                     self._verbose_callback(
                         f"[worker {worker_id}][{context_name}] -> '{result}'"
                     )
                 return result, logits, pkv
             generated = combined
             logits, pkv = self._forward([next_id], pkv)
-        if self.verbose and self._verbose_callback:
+        if self.verbose:
             self._verbose_callback(
-                f"[worker {worker_id}][{context_name} incompleto] -> '{generated}'"
+                f"[worker {worker_id}]"
+                f"[{context_name} incompleto] -> '{generated}'"
             )
         return generated, logits, pkv
 
@@ -167,7 +173,7 @@ class ConstrainedDecoder:
         worker_id: int = 0,
     ) -> Tuple[str, Dict[str, Any]]:
         if use_cache and user_prompt in self._cache:
-            if self.verbose and self._verbose_callback:
+            if self.verbose:
                 self._verbose_callback(
                     f"[worker {worker_id}] cache hit '{user_prompt}'"
                 )
@@ -184,7 +190,7 @@ class ConstrainedDecoder:
         fn_name = fn_raw.strip()
 
         if fn_name not in self._fn_by_name:
-            if self.verbose and self._verbose_callback:
+            if self.verbose:
                 self._verbose_callback(
                     f"[worker {worker_id}] recuperación nombre '{fn_name}' "
                     "no encontrado"
@@ -225,9 +231,10 @@ class ConstrainedDecoder:
                     args[key] = float(clean)
                 except ValueError:
                     recovered = _extract_number(clean)
-                    if self.verbose and self._verbose_callback:
+                    if self.verbose:
                         self._verbose_callback(
-                            f"[worker {worker_id}] parseo '{clean}' -> {recovered}"
+                            f"[worker {worker_id}] "
+                            f"parseo '{clean}' -> {recovered}"
                         )
                     args[key] = recovered
             else:
@@ -262,7 +269,8 @@ class ConstrainedDecoder:
             Callable[[int, str, Tuple[str, Dict[str, Any]], int], None]
         ] = None,
     ) -> List[Tuple[str, Dict[str, Any]]]:
-        results: List[Optional[Tuple[str, Dict[str, Any]]]] = [None] * len(prompts)
+        results: List[Optional[Tuple[str,
+                                     Dict[str, Any]]]] = [None] * len(prompts)
 
         def _worker(
             idx: int, prompt: str, wid: int
@@ -286,8 +294,10 @@ class ConstrainedDecoder:
 
         return [r for r in results if r is not None]
 
-    def _update_cache(self, prompt: str, result: Tuple[str, Dict[str, Any]]) -> None:
-        if self._cache_size is not None and len(self._cache) >= self._cache_size:
+    def _update_cache(self,
+                      prompt: str, result: Tuple[str, Dict[str, Any]]) -> None:
+        if (self._cache_size is not None and
+                len(self._cache) >= self._cache_size):
             oldest = next(iter(self._cache.keys()))
             del self._cache[oldest]
         self._cache[prompt] = result

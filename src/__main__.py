@@ -8,11 +8,14 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from pydantic import BaseModel
+from pydantic import ValidationError
 
 
 from .decoder import ConstrainedDecoder
-from .schema_utils import FunctionDefinition, load_function_definitions
+from .schema_utils import (
+                            FunctionDefinition, TestCase,
+                            OutputRecord, load_function_definitions
+                          )
 
 try:
     from llm_sdk import Small_LLM_Model
@@ -44,7 +47,11 @@ def _fmt(secs: float) -> str:
 
 def _bar_line(desc: str, filled: int, total: int, elapsed: float) -> str:
     rate = filled / elapsed if elapsed > 0 else 0.0
-    eta: Optional[float] = (total - filled) / rate if rate > 0 and filled else None
+    eta: Optional[float] = (
+     (total - filled) / rate
+     if rate > 0 and filled
+     else None
+    )
     eta_str = _fmt(eta) if eta is not None else "--:--"
     bar = _bar(filled, total)
     label = f"{desc}:".ljust(_LABEL_W)
@@ -54,7 +61,8 @@ def _bar_line(desc: str, filled: int, total: int, elapsed: float) -> str:
 class ProgressBar:
     """Barra de progreso con actualización automática del tiempo."""
 
-    def __init__(self, desc: str, total: int, refresh_interval: float = 0.2) -> None:
+    def __init__(self, desc: str, total: int,
+                 refresh_interval: float = 0.2) -> None:
         self.desc = desc
         self.total = total
         self.filled = 0
@@ -63,7 +71,8 @@ class ProgressBar:
         self._running = True
         self._refresh_interval = refresh_interval
         self._redraw()
-        self._timer_thread = threading.Thread(target=self._auto_refresh, daemon=True)
+        self._timer_thread = threading.Thread(target=self._auto_refresh,
+                                              daemon=True)
         self._timer_thread.start()
 
     def _auto_refresh(self) -> None:
@@ -140,16 +149,6 @@ def task(desc: str) -> SimpleTask:
     return SimpleTask(desc)
 
 
-class TestCase(BaseModel):
-    prompt: str
-
-
-class OutputRecord(BaseModel):
-    prompt: str
-    fn_name: str
-    args: Dict[str, Any]
-
-
 def load_vocab(model: Any) -> Dict[int, str]:
     tokenizer = model._tokenizer
     vocab: Dict[str, int] = tokenizer.get_vocab()
@@ -167,7 +166,8 @@ def load_test_cases(path: Path) -> List[TestCase]:
     return [TestCase(**item) for item in data]
 
 
-def compute_workers(num_prompts: int, user_workers: Optional[int] = None) -> int:
+def compute_workers(num_prompts: int,
+                    user_workers: Optional[int] = None) -> int:
     if user_workers is not None:
         return max(1, user_workers)
     cpu_count = os.cpu_count() or 4
@@ -183,11 +183,17 @@ def parse_arguments() -> argparse.Namespace:
         "--input", type=str, default="data/input/function_calling_tests.json"
     )
     parser.add_argument(
-        "--output", type=str, default="data/output/function_calling_results.json"
+        "--output", type=str,
+        default="data/output/function_calling_results.json"
+    )
+    parser.add_argument(
+        "--definitions", type=str,
+        default="data/input/functions_definition.json",
+        help="Ruta al archivo JSON con las definiciones de funciones"
     )
     parser.add_argument(
         "--verbose", action="store_true",
-        help="Muestra generación token a token (en gris)"
+        help="Muestra generación token a token"
     )
     parser.add_argument(
         "--no-cache", action="store_true", help="Desactiva caché de resultados"
@@ -206,20 +212,36 @@ def main() -> None:
     base_dir = Path.cwd()
     input_path = base_dir / args.input
     output_path = base_dir / args.output
-    defs_path = base_dir / "data" / "input" / "functions_definition.json"
-
+    defs_path = base_dir / args.definitions
     for label, path in (("input", input_path), ("definitions", defs_path)):
         if not path.exists():
             sys.exit(f"Error: archivo de {label} no encontrado: {path}")
 
-    functions: List[FunctionDefinition]
-    with task("Loading definitions"):
-        functions = load_function_definitions(defs_path)
+    try:
+        with task("Loading definitions"):
+            functions: List[FunctionDefinition]
+            functions = load_function_definitions(defs_path)
+    except json.JSONDecodeError as e:
+        sys.exit("Error: el archivo de definiciones no "
+                 f"es un JSON válido: {e}")
+    except ValidationError as e:
+        sys.exit("Error: el contenido del JSON no cumple el"
+                 f"esquema esperado:\n{e}")
+    except Exception as e:
+        sys.exit(f"Error inesperado al cargar definiciones: {e}")
     print(f"  ✓ {len(functions)} function(s) loaded.")
 
-    test_cases: List[TestCase]
-    with task("Loading test cases"):
-        test_cases = load_test_cases(input_path)
+    try:
+        with task("Loading test cases"):
+            test_cases: List[TestCase] = load_test_cases(input_path)
+    except json.JSONDecodeError as e:
+        sys.exit("Error: el archivo de tests no "
+                 f"es un JSON válido: {e}")
+    except ValidationError as e:
+        sys.exit("Error: el contenido del JSON no cumple el"
+                 f"esquema esperado:\n{e}")
+    except Exception as e:
+        sys.exit(f"Error inesperado al cargar tests: {e}")
     print(f"  ✓ {len(test_cases)} test case(s) loaded.")
 
     devnull = open(os.devnull, "w")
@@ -240,7 +262,8 @@ def main() -> None:
     bar = ProgressBar("Processing prompts", len(test_cases))
 
     def verbose_callback(msg: str) -> None:
-        escaped = msg.replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
+        escaped = msg.replace('\n', '\\n').replace('\r',
+                                                   '\\r').replace('\t', '\\t')
         bar.log(f"{GRAY}{escaped}{RESET}")
 
     decoder = ConstrainedDecoder(
@@ -263,7 +286,8 @@ def main() -> None:
                     prompt, use_cache=not args.no_cache
                 )
                 results.append(
-                    OutputRecord(prompt=prompt, fn_name=fn_name, args=args_dict)
+                    OutputRecord(prompt=prompt,
+                                 fn_name=fn_name, args=args_dict)
                 )
                 bar.log(f"{GREEN}  ✓ {fn_name}  {args_dict}{RESET}")
             except Exception as exc:

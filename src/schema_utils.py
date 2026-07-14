@@ -1,7 +1,7 @@
 """Utilidades para cargar definiciones de funciones."""
 import json
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Any
 
 from pydantic import BaseModel, Field
 
@@ -15,6 +15,16 @@ class FunctionDefinition(BaseModel):
     description: str
     parameters: Dict[str, ParameterDef] = Field(default_factory=dict)
     returns: Dict[str, str]
+
+
+class TestCase(BaseModel):
+    prompt: str
+
+
+class OutputRecord(BaseModel):
+    prompt: str
+    fn_name: str
+    args: Dict[str, Any]
 
 
 def load_function_definitions(path: Path) -> List[FunctionDefinition]:

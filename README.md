@@ -52,6 +52,7 @@ uv run python -m src --input data/input/my_tests.json --output data/output/resul
 |---|---|
 | `--input <ruta>` | JSON de prompts de entrada (por defecto `data/input/function_calling_tests.json`) |
 | `--output <ruta>` | JSON de resultados de salida (por defecto `data/output/function_calling_results.json`) |
+| `--definitions <ruta>` | JSON de definiciones de funciones (por defecto `data/input/functions_definition.json`) |
 | `--verbose` | Muestra la generación token a token en gris por debajo de los resultados |
 | `--no-cache` | Desactiva la caché LRU de resultados |
 | `--no-batch` | Procesa los prompts secuencialmente en lugar de en paralelo |

@@ -4,20 +4,19 @@ version = "0.1.0"
 description = "Function calling with constrained decoding using LLMs"
 requires-python = ">=3.10"
 dependencies = [
-    "torch>=2.0.0",
-    "transformers>=4.40.0",
-    "huggingface-hub>=0.20.0",
     "pydantic>=2.0",
     "numpy>=1.24",
+    "flake8>=7.3.0",
+    "mypy>=2.1.0",
+    "llm-sdk"
 ]
-
-[tool.flake8]
-max-line-length = 99
-extend-ignore = ["E203"]
+[tool.uv.sources]
+llm-sdk = { path = "./llm_sdk" }
 
 [tool.mypy]
-warn_return_any = true
-warn_unused_ignores = true
+mypy_path = "llm_sdk"
+
+[[tool.mypy.overrides]]
+module = "llm_sdk"
 ignore_missing_imports = true
-disallow_untyped_defs = true
-check_untyped_defs = true
+ignore_errors = true
